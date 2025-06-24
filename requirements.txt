@@ -1,2 +1,3 @@
 numpy
-yt-dlp 
+yt-dlp
+tqdm

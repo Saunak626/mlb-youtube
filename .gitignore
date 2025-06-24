@@ -1,1 +1,11 @@
 videos/
+
+*.mp4
+*.mkv
+*.part
+*.txt
+*.json
+*.log
+*.log.*
+*.log.*.*
+*.log.*.*.*
