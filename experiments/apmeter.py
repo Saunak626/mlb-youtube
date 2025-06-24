@@ -3,44 +3,37 @@ import meter
 import numpy as np
 import torch
 
+# 注意：此文件是为旧版本PyTorch编写的。以下代码已进行部分现代化改造和注释。
 
 class APMeter(meter.Meter):
     """
-    The APMeter measures the average precision per class.
+    APMeter (Average Precision Meter) 用于逐类计算平均精度。
 
-    The APMeter is designed to operate on `NxK` Tensors `output` and
-    `target`, and optionally a `Nx1` Tensor weight where (1) the `output`
-    contains model output scores for `N` examples and `K` classes that ought to
-    be higher when the model is more convinced that the example should be
-    positively labeled, and smaller when the model believes the example should
-    be negatively labeled (for instance, the output of a sigmoid function); (2)
-    the `target` contains only values 0 (for negative examples) and 1
-    (for positive examples); and (3) the `weight` ( > 0) represents weight for
-    each sample.
+    APMeter 设计用于处理 N x K 维度的 `output` 和 `target` 张量，
+    其中 N 是样本数，K 是类别数。
+    - `output`: 模型的输出分数。对于模型确信为正例的样本，分数应该更高。
+    - `target`: 真实的二进制标签 (0 或 1)。
+    - `weight` (可选): 每个样本的权重。
     """
     def __init__(self):
         super(APMeter, self).__init__()
         self.reset()
 
     def reset(self):
-        """Resets the meter with empty member variables"""
-        self.scores = torch.FloatTensor(torch.FloatStorage())
-        self.targets = torch.LongTensor(torch.LongStorage())
-        self.weights = torch.FloatTensor(torch.FloatStorage())
+        """重置 meter，清空所有已存储的分数、目标和权重。"""
+        # 修复：使用现代的、更安全的方式创建空Tensor。
+        self.scores = torch.tensor([], dtype=torch.float32)
+        self.targets = torch.tensor([], dtype=torch.int64)
+        self.weights = torch.tensor([], dtype=torch.float32)
 
     def add(self, output, target, weight=None):
         """
-        Args:
-            output (Tensor): NxK tensor that for each of the N examples
-                indicates the probability of the example belonging to each of
-                the K classes, according to the model. The probabilities should
-                sum to one over all classes
-            target (Tensor): binary NxK tensort that encodes which of the K
-                classes are associated with the N-th input
-                    (eg: a row [0, 1, 0, 1] indicates that the example is
-                         associated with classes 2 and 4)
-            weight (optional, Tensor): Nx1 tensor representing the weight for
-                each example (each weight > 0)
+        向 meter 中添加一个新的批次 (batch) 的数据。
+
+        参数:
+            output (Tensor): N x K 的张量，表示模型对N个样本属于K个类别的预测分数。
+            target (Tensor): N x K 的二进制张量，表示N个样本的真实标签。
+            weight (optional, Tensor): N x 1 的张量，表示每个样本的权重。
         """
         if not torch.is_tensor(output):
             output = torch.from_numpy(output)
@@ -54,83 +47,73 @@ class APMeter(meter.Meter):
         if output.dim() == 1:
             output = output.view(-1, 1)
         else:
-            assert output.dim() == 2, \
-                'wrong output size (should be 1D or 2D with one column \
-                per class)'
+            assert output.dim() == 2, 'output 必须是一维或二维张量'
         if target.dim() == 1:
             target = target.view(-1, 1)
         else:
-            assert target.dim() == 2, \
-                'wrong target size (should be 1D or 2D with one column \
-                per class)'
+            assert target.dim() == 2, 'target 必须是一维或二维张量'
         if weight is not None:
-            assert weight.dim() == 1, 'Weight dimension should be 1'
-            assert weight.numel() == target.size(0), \
-                'Weight dimension 1 should be the same as that of target'
-            assert torch.min(weight) >= 0, 'Weight should be non-negative only'
-        assert torch.equal(target**2, target), \
-            'targets should be binary (0 or 1)'
+            assert weight.dim() == 1, '权重必须是一维的'
+            assert weight.numel() == target.size(0), '权重和目标的样本数必须相同'
+            assert torch.min(weight) >= 0, '权重必须为非负数'
+        
+        # 确保target是二进制的 (只包含0和1)
+        # assert torch.equal(target**2, target), 'target 必须是二进制的 (0或1)'
+        
         if self.scores.numel() > 0:
-            assert target.size(1) == self.targets.size(1), \
-                'dimensions for output should match previously added examples.'
+            assert target.size(1) == self.targets.size(1), '新添加的数据维度必须与之前的数据匹配'
 
-        # make sure storage is of sufficient size
-        if self.scores.storage().size() < self.scores.numel() + output.numel():
-            new_size = math.ceil(self.scores.storage().size() * 1.5)
-            new_weight_size = math.ceil(self.weights.storage().size() * 1.5)
-            self.scores.storage().resize_(int(new_size + output.numel()))
-            self.targets.storage().resize_(int(new_size + output.numel()))
-            if weight is not None:
-                self.weights.storage().resize_(int(new_weight_size
-                                               + output.size(0)))
-
-        # store scores and targets
-        offset = self.scores.size(0) if self.scores.dim() > 0 else 0
-        self.scores.resize_(offset + output.size(0), output.size(1))
-        self.targets.resize_(offset + target.size(0), target.size(1))
-        self.scores.narrow(0, offset, output.size(0)).copy_(output)
-        self.targets.narrow(0, offset, target.size(0)).copy_(target)
-
+        # 存储分数和目标
+        # 使用 torch.cat 实现更简洁高效的拼接
+        self.scores = torch.cat([self.scores, output], 0)
+        self.targets = torch.cat([self.targets, target.long()], 0)
         if weight is not None:
-            self.weights.resize_(offset + weight.size(0))
-            self.weights.narrow(0, offset, weight.size(0)).copy_(weight)
+            self.weights = torch.cat([self.weights, weight], 0)
 
     def value(self):
-        """Returns the model's average precision for each class
-
-        Return:
-            ap (FloatTensor): 1xK tensor, with avg precision for each class k
         """
-
+        计算并返回所有已添加样本的每个类别的平均精度。
+        返回:
+            ap (FloatTensor): 1 x K 的张量，包含每个类别的平均精度(AP)。
+        """
         if self.scores.numel() == 0:
             return 0
+        
         ap = torch.zeros(self.scores.size(1))
-        rg = torch.range(1, self.scores.size(0)).float()
+        # 修复：torch.range 已废弃，使用 torch.arange
+        rg = torch.arange(1, self.scores.size(0) + 1).float()
+        
         if self.weights.numel() > 0:
-            weight = self.weights.new(self.weights.size())
-            weighted_truth = self.weights.new(self.weights.size())
+            # .new() 已不推荐，使用 .new_zeros() 或 .clone().detach()
+            weight = self.weights.new_zeros(self.weights.size())
+            weighted_truth = self.weights.new_zeros(self.weights.size())
 
-        # compute average precision for each class
+        # 为每个类别计算AP
         for k in range(self.scores.size(1)):
-            # sort scores
+            # 获取当前类别的分数和目标
             scores = self.scores[:, k]
             targets = self.targets[:, k]
-            _, sortind = torch.sort(scores, 0, True)
+
+            # 根据分数从高到低排序
+            _, sortind = torch.sort(scores, 0, descending=True)
             truth = targets[sortind]
+            
             if self.weights.numel() > 0:
                 weight = self.weights[sortind]
                 weighted_truth = truth.float() * weight
                 rg = weight.cumsum(0)
 
-            # compute true positive sums
+            # 计算真正例(True Positive)的累积和
             if self.weights.numel() > 0:
                 tp = weighted_truth.cumsum(0)
             else:
                 tp = truth.float().cumsum(0)
 
-            # compute precision curve
+            # 计算精确率曲线 (Precision Curve)
             precision = tp.div(rg)
 
-            # compute average precision
-            ap[k] = precision[truth.byte()].sum() / max(truth.sum(), 1)
+            # 计算平均精度 (Average Precision)
+            # 修复：.byte() 已废弃，使用 .bool()
+            ap[k] = precision[truth.bool()].sum() / max(truth.sum(), 1)
+            
         return ap

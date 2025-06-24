@@ -1,5 +1,6 @@
 videos/
 
+*.pyc
 *.mp4
 *.mkv
 *.part

@@ -1,3 +1,4 @@
 numpy
 yt-dlp
 tqdm
+h5py

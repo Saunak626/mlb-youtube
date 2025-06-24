@@ -1,8 +1,20 @@
 from __future__ import division
-import time
 import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.autograd import Variable # 警告: Variable 已被废弃
+import numpy as np
 import argparse
+
+# 导入本地模块
+import models
+import segmented_dataset as dset
+from apmeter import APMeter
+
+# --- 参数解析 ---
 def str2bool(v):
+    """一个辅助函数，用于将字符串转换为布尔值。"""
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
         return True
     elif v.lower() in ('no', 'false', 'f', 'n', '0'):
@@ -10,154 +22,116 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
-parser = argparse.ArgumentParser()
-parser.add_argument('-mode', type=str, help='rgb or flow')
-parser.add_argument('-train', type=str2bool, default='True', help='train or eval')
-parser.add_argument('-model_file', type=str)
-parser.add_argument('-rgb_model_file', type=str)
-parser.add_argument('-flow_model_file', type=str)
-parser.add_argument('-gpu', type=int, default=1)
-parser.add_argument('-dataset', type=str, default='i3d')
+parser = argparse.ArgumentParser(description='Train action recognition models on segmented videos')
+parser.add_argument('--model', type=str, default='sub_event', help='Model to use (e.g., sub_event, tconv, pyramid)')
+parser.add_argument('--root', type=str, default='../data/i3d_features', help='Path to the directory with I3D feature files (.npy)')
+parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
+parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
+parser.add_argument('--gpu', type=str, default='0', help='GPU device ID to use')
+parser.add_argument('--save-dir', type=str, default='saved_models', help='Directory to save trained models')
 
 args = parser.parse_args()
-print args
 
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   
-os.environ["CUDA_VISIBLE_DEVICES"]=str(args.gpu)
-
-
-import torch
-torch.backends.cudnn.benchmark=True
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.optim import lr_scheduler
-from torch.autograd import Variable
-
-import torchvision
-from torchvision import datasets, transforms
-
-
-import numpy as np
-import json
-
-import models
-import segmented_dataset as sd
-from apmeter import APMeter
-
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-
-batch_size = 32
-dataset = sd.SegmentedPitchResultMultiLabel('mlb-youtube-segmented.json', 'mlb-youtube-negative.json', 'training', '/')
-
-dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, collate_fn=sd.collate_fn)
-
-val_dataset = sd.SegmentedPitchResultMultiLabel('mlb-youtube-segmented.json', 'mlb-youtube-negative.json', 'testing', '/')
-val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=1, shuffle=True, num_workers=2, pin_memory=True, collate_fn=sd.collate_fn)
-
-dataloaders = {'train': dataloader, 'val': val_dataloader}
-datasets = {'train': dataset, 'val': val_dataset}
-
-def pool(f, s, e):
-    s = int(s)
-    e = int(e)
-    return torch.max(f[:,:, s:e], dim=2)[0].unsqueeze(2)
-
-# train the model
+# --- 训练主函数 ---
 def train_model(model, criterion, optimizer, num_epochs=50):
-    since = time.time()
-    val_res = {}
-    best_acc = 0
-
+    """
+    模型训练和评估的主循环。
+    """
     for epoch in range(num_epochs):
-        print 'Epoch {}/{}'.format(epoch, num_epochs - 1)
-        print '-' * 10
+        print(f'Epoch {epoch}/{num_epochs - 1}')
+        print('-' * 10)
 
-        # Each epoch has a training and validation phase
+        # 每个epoch都有一个训练阶段和一个验证阶段
         for phase in ['train', 'val']:
-            apm = APMeter()
             if phase == 'train':
-                model.train(True)
+                model.train()  # 设置模型为训练模式
             else:
-                model.train(False)  # Set model to evaluate mode
-                
-            tot_loss = 0.0
-            error = 0.0
-            num_iter = 0.
+                model.eval()   # 设置模型为评估模式
 
-            tr = {}
-            # Iterate over data.
+            total_loss = 0.0
+            ap_meter = APMeter() # 用于评估平均精度的工具
+
+            # 迭代数据
             for data in dataloaders[phase]:
-                num_iter += 1
-                # get the inputs
-                features, mask, labels, name = data
-
-
-                # wrap them in Variable
-                features = Variable(features.cuda())
-                labels = Variable(labels.float().cuda())
-                mask = Variable(mask.cuda())#.unsqueeze(1)
+                # 1. 准备输入数据并转移到指定设备 (GPU)
+                # 修复: 移除 Variable, 使用 .to(device)
+                inputs, mask, labels, _ = data
+                inputs = inputs.to(device)
+                labels = labels.to(device).float()
                 
-                # zero the parameter gradients
+                # 2. 梯度清零
                 optimizer.zero_grad()
-                                
-                # forward
 
-                #un-comment for max-pooling
-                #features = torch.max(features, dim=2)[0].unsqueeze(2)
-                #outputs = model(features)
+                # 3. 前向传播
+                with torch.set_grad_enabled(phase == 'train'):
+                    # 将特征和长度（这里用mask代替）作为元组传入
+                    model_input = (inputs.squeeze(2), mask.sum(dim=1))
+                    outputs = model(model_input)
+                    
+                    # 计算损失
+                    loss = criterion(outputs, labels)
+
+                    # 4. 反向传播和优化（仅在训练阶段）
+                    if phase == 'train':
+                        loss.backward()
+                        optimizer.step()
                 
-                # un-comment for pyramid
-                #b,c,t,h,w = features.size()
-                #features = [pool(features,0,t), pool(features,0,t/2),pool(features,t/2,t),pool(features,0,t/4),pool(features,t/4,t/2),pool(features,t/2,3*t/4),pool(features,3*t/4,t)]
-                #features = torch.cat(features, dim=1)
-                #outputs = model(features)
+                # 统计损失和精度
+                total_loss += loss.item() * inputs.size(0)
+                ap_meter.add(torch.sigmoid(outputs).detach().cpu().numpy(), labels.cpu().numpy())
 
+            epoch_loss = total_loss / dataset_sizes[phase]
+            epoch_ap = ap_meter.value().mean()
 
-                # sub-event learning
-                outputs = model([features, torch.sum(mask, dim=1)])
+            print(f'{phase} Loss: {epoch_loss:.4f} mAP: {epoch_ap:.4f}')
 
+        # 在每个epoch后保存模型
+        if not os.path.exists(args.save_dir):
+            os.makedirs(args.save_dir)
+        torch.save(model.state_dict(), os.path.join(args.save_dir, f'{args.model}_{epoch}.pt'))
 
-                outputs = outputs.squeeze() # remove spatial dims
-                if features.size(0) == 1:
-                    outputs = outputs.unsqueeze(0)
-                #outputs = outputs.permute(0,2,1)
+    return model
 
-                # action-prediction loss
-                loss = criterion(outputs, labels)
+if __name__ == '__main__':
+    # --- 环境和设备设置 ---
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-                probs = torch.sigmoid(outputs)
-                apm.add(probs.data.cpu().numpy(), (labels > 0.5).float().data.cpu().numpy())
+    # --- 数据加载 ---
+    # 定义JSON文件路径
+    pos_json = '../data/mlb-youtube-segmented.json'
+    neg_json = '../data/mlb-youtube-negative.json'
+    
+    # 创建训练和验证数据集
+    image_datasets = {
+        'train': dset.SegmentedPitchResultMultiLabel(pos_json, neg_json, 'training', args.root),
+        'val': dset.SegmentedPitchResultMultiLabel(pos_json, neg_json, 'testing', args.root)
+    }
 
-                # backward + optimize only if in training phase
-                if phase == 'train':
-                    loss.backward()
-                    optimizer.step()
-                # statistics
-                tot_loss += loss.data[0]
+    # 创建数据加载器 (Dataloaders)
+    dataloaders = {
+        x: torch.utils.data.DataLoader(image_datasets[x], batch_size=args.batch_size,
+                                      shuffle=True, num_workers=4, collate_fn=dset.collate_fn)
+        for x in ['train', 'val']
+    }
+    dataset_sizes = {x: len(image_datasets[x]) for x in ['train', 'val']}
 
-            epoch_loss = tot_loss / num_iter
-            if phase == 'val' and apm.value().mean() > best_acc:
-                best_acc = apm.value().mean()
-                val_res = tr
+    # --- 模型、损失函数、优化器设置 ---
+    # 1. 根据命令行参数构建模型
+    num_classes = 8 # 8个动作类别
+    model = getattr(models, args.model)(inp=1024, classes=num_classes)
+    model.to(device) # 将模型转移到GPU
+    
+    # 2. 定义损失函数
+    # BCEWithLogitsLoss 更稳定，因为它内部集成了 sigmoid
+    criterion = nn.BCEWithLogitsLoss()
 
-            print '{} Loss: {:.4f} mAP: {:.4f}'.format(phase, epoch_loss, apm.value().mean())
+    # 3. 定义优化器
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-inp_feat =  1024
-#model = models.per_frame(inp_feat, 6)
-model = models.sub_event(inp_feat, 6)
-#model = models.tconv(inp_feat, 8)
-#model = models.pyramid(inp_feat, 8)
-#model = models.max_pool(inp_feat, 8)
-
-# move to GPU
-model.cuda()
-
-criterion = nn.BCEWithLogitsLoss()
-
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-train_model(model, criterion, optimizer, num_epochs=10)
+    # --- 开始训练 ---
+    print(f"Training model: {args.model}")
+    trained_model = train_model(model, criterion, optimizer, num_epochs=args.epochs)
+    print("Training complete.")

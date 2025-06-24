@@ -1,7 +1,16 @@
-from __future__ import division
-import time
 import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
 import argparse
+
+# 导入本地模块
+import mlb_continuous_models as models
+import mlb_i3d_per_video as dset
+from apmeter import APMeter
+
+# --- 参数解析 ---
 def str2bool(v):
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
         return True
@@ -10,244 +19,95 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
-parser = argparse.ArgumentParser()
-parser.add_argument('-mode', type=str, help='rgb or flow (or joint for eval)')
-parser.add_argument('-train', type=str2bool, default='True', help='train or eval')
-parser.add_argument('-model_file', type=str)
-parser.add_argument('-rgb_model_file', type=str)
-parser.add_argument('-flow_model_file', type=str)
-parser.add_argument('-gpu', type=str, default='1')
-parser.add_argument('-dataset', type=str, default='charades')
+parser = argparse.ArgumentParser(description='Train continuous action detection models')
+parser.add_argument('--model', type=str, default='get_tsf_model', help='Model to use (e.g., get_tsf_model, get_baseline_model)')
+parser.add_argument('--root', type=str, default='../data/i3d_features_continuous', help='Path to continuous video feature files (.npy)')
+parser.add_argument('--split-file', type=str, default='../data/mlb-youtube-continuous.json', help='Path to the continuous annotation JSON file')
+parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
+parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+parser.add_argument('--batch-size', type=int, default=1, help='Batch size for continuous detection is typically 1')
+parser.add_argument('--gpu', type=str, default='0', help='GPU device ID to use')
+parser.add_argument('--save-dir', type=str, default='saved_models_continuous', help='Directory to save trained models')
 
 args = parser.parse_args()
 
-#os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   
-os.environ["CUDA_VISIBLE_DEVICES"]=str(args.gpu)
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.optim import lr_scheduler
-from torch.autograd import Variable
-
-import torchvision
-from torchvision import datasets, transforms
-
-
-import numpy as np
-import json
-
-import super_event
-from apmeter import APMeter
-
-from mlb_i3d_per_video import MLB as Dataset
-from mlb_i3d_per_video import mt_collate_fn as collate_fn
-train_split = 'data/mlb-youtube-continuous.json’
-test_split = train_split
-rgb_root = '/ssd2/mlb/i3d_rgb'
-flow_root = '/ssd2/mlb/i3d_flow'
-classes = 8
-batch_size = 16
-    
-
-
-def sigmoid(x):
-    return 1/(1+np.exp(-x))
-
-def load_data(train_split, val_split, root):
-    # Load Data
-
-    if len(train_split) > 0:
-        dataset = Dataset(train_split, 'training', root, batch_size)
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True, collate_fn=collate_fn)
-        dataloader.root = root
-    else:
-        
-        dataset = None
-        dataloader = None
-
-    val_dataset = Dataset(val_split, 'testing', root, batch_size)
-    val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=1, shuffle=True, num_workers=2, pin_memory=True, collate_fn=collate_fn)
-    val_dataloader.root = root
-
-    dataloaders = {'train': dataloader, 'val': val_dataloader}
-    datasets = {'train': dataset, 'val': val_dataset}
-    return dataloaders, datasets
-
-
-# train the model
-def run(models, criterion, num_epochs=50):
-    since = time.time()
-
-    best_loss = 10000
+# --- 训练主函数 ---
+def run(model, criterion, optimizer, dataloaders, device, num_epochs=50):
     for epoch in range(num_epochs):
-        print 'Epoch {}/{}'.format(epoch, num_epochs - 1)
-        print '-' * 10
+        print(f'Epoch {epoch}/{num_epochs - 1}')
+        print('-' * 10)
 
-        probs = []
-        for model, gpu, dataloader, optimizer, sched, model_file in models:
-            train_step(model, gpu, optimizer, dataloader['train'])
-            prob_val, val_loss = val_step(model, gpu, dataloader['val'])
-            probs.append(prob_val)
-            sched.step(val_loss)
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                model.train()
+            else:
+                model.eval()
 
-            if val_loss < best_loss:
-                best_loss = val_loss
-                torch.save(model.state_dict(), 'models/'+model_file)
+            ap_meter = APMeter()
+            total_loss = 0.0
 
-def eval_model(model, dataloader, baseline=False):
-    results = {}
-    for data in dataloader:
-        other = data[3]
-        outputs, loss, probs, _ = run_network(model, data, 0, baseline)
-        fps = outputs.size()[1]/other[1][0]
+            for data in dataloaders[phase]:
+                inputs, mask, labels, _ = data
+                inputs = inputs.to(device)
+                labels = labels.to(device).float()
+                mask = mask.to(device)
 
-        results[other[0][0]] = (outputs.data.cpu().numpy()[0], probs.data.cpu().numpy()[0], data[2].numpy()[0], fps)
-    return results
+                optimizer.zero_grad()
 
-def run_network(model, data, gpu, baseline=False):
-    # get the inputs
-    inputs, mask, labels, other = data
-    
-    # wrap them in Variable
-    inputs = Variable(inputs.cuda(gpu))
-    mask = Variable(mask.cuda(gpu))
-    labels = Variable(labels.cuda(gpu))
-    
-    cls_wts = torch.FloatTensor([1.00]).cuda(gpu)
+                with torch.set_grad_enabled(phase == 'train'):
+                    # 模型输入是 (B, C, T, H, W)
+                    outputs = model(inputs)
+                    # 输出形状是 (B, Classes, T, H, W), 需要调整以匹配标签
+                    outputs = outputs.squeeze(-1).squeeze(-1).permute(0, 2, 1) # (B, T, C)
+                    
+                    # 为了计算损失，只考虑有标签的部分 (mask=1)
+                    loss = criterion(outputs[mask.bool()], labels[mask.bool()])
 
-    # forward
-    if not baseline:
-        outputs = model([inputs, torch.sum(mask, 1)])
-    else:
-        outputs = model(inputs)
-    outputs = outputs.squeeze(3).squeeze(3).permute(0,2,1) # remove spatial dims
-    ##outputs = outputs.permute(0,2,1) # remove spatial dims
-    probs = F.sigmoid(outputs) * mask.unsqueeze(2)
-    
-    # binary action-prediction loss
-    loss = F.binary_cross_entropy_with_logits(outputs, labels, size_average=False)#, weight=cls_wts)
+                    if phase == 'train':
+                        loss.backward()
+                        optimizer.step()
 
-    
-    loss = torch.sum(loss) / torch.sum(mask) # mean over valid entries
-    
-    # compute accuracy
-    corr = torch.sum(mask)
-    tot = torch.sum(mask)
+                total_loss += loss.item() * inputs.size(0)
+                # 计算mAP时也只考虑有效部分
+                ap_meter.add(torch.sigmoid(outputs[mask.bool()]).detach().cpu().numpy(), labels[mask.bool()].cpu().numpy())
 
-    return outputs, loss, probs, corr/tot
-            
-                
-
-def train_step(model, gpu, optimizer, dataloader):
-    model.train(True)
-    tot_loss = 0.0
-    error = 0.0
-    num_iter = 0.
-    
-    # Iterate over data.
-    for data in dataloader:
-        optimizer.zero_grad()
-        num_iter += 1
+            epoch_loss = total_loss / len(dataloaders[phase].dataset)
+            epoch_map = ap_meter.value().mean()
+            print(f'{phase} Loss: {epoch_loss:.4f} mAP: {epoch_map:.4f}')
         
-        outputs, loss, probs, err = run_network(model, data, gpu)
-        
-        error += err.data[0]
-        tot_loss += loss.data[0]
-        
-        loss.backward()
-        optimizer.step()
-    epoch_loss = tot_loss / num_iter
-    error = error / num_iter
-    print 'train-{} Loss: {:.4f} Acc: {:.4f}'.format(dataloader.root, epoch_loss, error)
+        # 保存模型
+        if not os.path.exists(args.save_dir):
+            os.makedirs(args.save_dir)
+        torch.save(model.state_dict(), os.path.join(args.save_dir, f'continuous_{args.model}_{epoch}.pt'))
 
-  
-
-def val_step(model, gpu, dataloader):
-    model.train(False)
-    apm = APMeter()
-    tot_loss = 0.0
-    error = 0.0
-    num_iter = 0.
-    num_preds = 0
-
-    full_probs = {}
-
-
-    # Iterate over data.
-    for data in dataloader:
-        num_iter += 1
-        other = data[3]
-        
-        outputs, loss, probs, err = run_network(model, data, gpu)
-        apm.add(probs.data.cpu().numpy()[0], data[2].numpy()[0])
-        
-        error += err.data[0]
-        tot_loss += loss.data[0]
-        
-        # post-process preds
-        outputs = outputs.squeeze()
-        probs = probs.squeeze()
-        fps = outputs.size()[1]/other[1][0]
-        full_probs[other[0][0]] = (probs.data.cpu().numpy().T, fps)
-        
-        
-    epoch_loss = tot_loss / num_iter
-    error = error / num_iter
-    print 'val-map:', apm.value().mean()
-    apm.reset()
-    print 'val-{} Loss: {:.4f} Acc: {:.4f}'.format(dataloader.root, epoch_loss, error)
-    
-    return full_probs, epoch_loss
-
+    return model
 
 if __name__ == '__main__':
+    # --- 环境和设备设置 ---
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    if args.mode == 'flow':
-        dataloaders, datasets = load_data(train_split, test_split, flow_root)
-    elif args.mode == 'rgb':
-        dataloaders, datasets = load_data(train_split, test_split, rgb_root)
+    # --- 数据加载 ---
+    datasets = {
+        'train': dset.MLB(args.split_file, 'training', args.root, args.batch_size),
+        'val': dset.MLB(args.split_file, 'testing', args.root, args.batch_size)
+    }
+    dataloaders = {
+        x: torch.utils.data.DataLoader(datasets[x], batch_size=args.batch_size,
+                                      shuffle=True, num_workers=4, collate_fn=dset.mt_collate_fn)
+        for x in ['train', 'val']
+    }
 
+    # --- 模型、损失函数、优化器设置 ---
+    num_classes = 8
+    model = getattr(models, args.model)(classes=num_classes)
+    model.to(device)
 
-    if args.train:
-        model = super_event.get_super_event_model(0, classes)
-        criterion = nn.NLLLoss(reduce=False)
-    
-        lr = 0.1*batch_size/len(datasets['train'])
-        print lr
-        optimizer = optim.Adam(model.parameters(), lr=lr)
-        lr_sched = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, verbose=True)
-        
-        run([(model,0,dataloaders,optimizer, lr_sched, args.model_file)], criterion, num_epochs=40)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    else:
-        print 'Evaluating...'
-        rgb_model = torch.load(args.rgb_model_file)
-        rgb_model.cuda()
-        dataloaders, datasets = load_data('', test_split, rgb_root)
-        rgb_results = eval_model(rgb_model, dataloaders['val'], baseline=True)
-
-        flow_model = torch.load(args.flow_model_file)
-        flow_model.cuda()
-        dataloaders, datasets = load_data('', test_split, flow_root)
-        flow_results = eval_model(flow_model, dataloaders['val'], baseline=True)
-
-        rapm = APMeter()
-        fapm = APMeter()
-        tapm = APMeter()
-
-
-        for vid in rgb_results.keys():
-            o,p,l,fps = rgb_results[vid]
-            rapm.add(sigmoid(o), l)
-            fapm.add(sigmoid(flow_results[vid][0]), l)
-            if vid in flow_results:
-                o2,p2,l2,fps = flow_results[vid]
-                o = (o[:o2.shape[0]]*.5+o2*.5)
-                p = (p[:p2.shape[0]]*.5+p2*.5)
-            tapm.add(sigmoid(o), l)
-        print 'rgb MAP:', rapm.value().mean()
-        print 'flow MAP:', fapm.value().mean()
-        print 'two-stream MAP:', tapm.value().mean()
+    # --- 开始训练 ---
+    print(f"Training model for continuous detection: {args.model}")
+    run(model, criterion, optimizer, dataloaders, device, num_epochs=args.epochs)
+    print("Training complete.")
